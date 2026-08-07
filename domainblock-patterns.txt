@@ -1,0 +1,28 @@
+# /etc/domainblock/domainblock-patterns.txt
+#
+# One reverse-DNS (PTR) pattern per line. If a connecting IP's hostname matches
+# any line here, that IP is blocked (from everything except your VPN ports).
+#
+# Syntax: shell-style globs. '*' matches one or more labels.
+#   *.googleusercontent.com   matches  foo.bc.googleusercontent.com
+#   *.compute.amazonaws.com   matches  ec2-1-2-3-4.compute.amazonaws.com
+#
+# Lines starting with '#' and blank lines are ignored.
+# Edit this file freely — no restart needed; the next run picks it up.
+
+# --- Your actual attacker (from the HA login screenshot) ---
+*.googleusercontent.com
+
+# --- Common cloud / hosting scanner sources ---
+*.amazonaws.com
+*.compute.amazonaws.com
+*.compute-1.amazonaws.com
+*.bc.googleusercontent.com
+
+# --- Add your own below, e.g. ---
+# *.digitalocean.com
+# *.linode.com
+# *.hetzner.com
+# *.ovh.net
+# *.scaleway.com
+# *.contabo.net

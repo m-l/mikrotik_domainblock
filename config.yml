@@ -1,0 +1,17 @@
+# config.yml  — lives in the same directory as domainblock.rb
+# Connection + behaviour settings.
+
+# --- RouterOS connection ---
+router_host: "10.162.0.1"      # <-- your RB4011's IP (the one the script can reach)
+router_port: 8728              # 8728 = plain API, 8729 = API-SSL (set router_tls: true)
+router_user: "domainblock"     # the restricted API user you created
+router_pass: "CHANGE_ME"       # <-- the domainblock user's password
+router_tls: false              # true if using API-SSL on 8729
+
+# --- Address lists (must match the firewall rules on the router) ---
+check_list:  "domainblock-check"    # queue of new inbound IPs to reverse-look-up
+banned_list: "domainblock-banned"   # IPs whose PTR matched a pattern (drop rule uses this)
+
+# --- Behaviour ---
+ban_timeout: "7d"    # how long a banned IP stays on the router before auto-expiring
+dns_timeout: 3       # seconds to wait per reverse-DNS lookup
