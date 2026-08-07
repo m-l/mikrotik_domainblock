@@ -2,7 +2,7 @@
 # Connection + behaviour settings.
 
 # --- RouterOS connection ---
-router_host: "10.162.0.1"      # <-- your RB4011's IP (the one the script can reach)
+router_host: "10.162.0.1"      # <-- your Mikrotik IP (the one the script can reach)
 router_port: 8728              # 8728 = plain API, 8729 = API-SSL (set router_tls: true)
 router_user: "domainblock"     # the restricted API user you created
 router_pass: "CHANGE_ME"       # <-- the domainblock user's password
