@@ -149,6 +149,99 @@ class RouterOS
 end
 
 # ============================================================================
+# WatchedPorts — keep the FORWARD/DSTNAT queue rule's dst-port list in sync
+# with the ports you INTENTIONALLY forward, discovered by a "#domainblock" tag
+# in the comment of your static NAT (dst-nat) rules.
+#
+#   - Tag NAT dstnat rules you want PTR-watched with "#domainblock".
+#   - This unions their to-ports (fallback dst-port) and writes that set onto
+#     the forward queue FILTER rule (chain=forward, add-src-to-address-list,
+#     also tagged "#domainblock").
+#   - Dynamic UPnP/NAT-PMP mappings (e.g. torrent 16881) are skipped.
+#   - Disabled NAT rules are skipped.
+#   - Writes ONLY the forward queue rule; the input queue rule is never touched.
+# ============================================================================
+module WatchedPorts
+  TAG = "#domainblock"
+
+  def self.split_ports(spec)
+    return [] if spec.nil? || spec.to_s.strip.empty?
+    spec.to_s.split(",").map(&:strip).reject(&:empty?)
+  end
+
+  def self.tagged?(comment) = comment.to_s.include?(TAG)
+  def self.truthy?(v)       = %w[true yes].include?(v.to_s.strip.downcase)
+  def self.nonempty(v)      = (v.nil? || v.to_s.strip.empty?) ? nil : v.to_s.strip
+  def self.numeric_key(p)   = (p =~ /\A\d+\z/ ? [0, p.to_i] : [1, p])
+
+  # Union of watched ports from tagged, enabled, static dst-nat rules.
+  # Port taken from to-ports (what the forward chain sees post-NAT), falling
+  # back to dst-port when the port is not translated.
+  def self.derive(nat_rules, exclude_ports: [])
+    excl = exclude_ports.map { |p| p.to_s.strip }
+    ports = []
+    nat_rules.each do |r|
+      next unless r["chain"]  == "dstnat"
+      next unless r["action"] == "dst-nat"
+      next if truthy?(r["disabled"])
+      next if truthy?(r["dynamic"])
+      next unless tagged?(r["comment"])
+      src = nonempty(r["to-ports"]) || nonempty(r["dst-port"])
+      next if src.nil?
+      ports.concat(split_ports(src))
+    end
+    ports.uniq.reject { |p| excl.include?(p) }.sort_by { |p| numeric_key(p) }
+  end
+
+  def self.forward_queue_rule(filter_rules)
+    filter_rules.find do |r|
+      r["chain"] == "forward" &&
+        r["action"] == "add-src-to-address-list" &&
+        tagged?(r["comment"])
+    end
+  end
+
+  def self.same_set?(current_spec, desired_ports)
+    split_ports(current_spec).sort == desired_ports.sort
+  end
+
+  # Call once per run, after the ban pass, reusing the connected api.
+  def self.reconcile(api, exclude_ports: [], logger: nil, dry_run: false)
+    nat    = api.talk(["/ip/firewall/nat/print"])
+    desired = derive(nat, exclude_ports: exclude_ports)
+
+    if desired.empty?
+      logger&.info "watched-ports: no tagged NAT rules resolved to a port; " \
+                   "leaving forward queue rule unchanged (refusing to widen/empty it)"
+      return
+    end
+
+    filters = api.talk(["/ip/firewall/filter/print"])
+    rule = forward_queue_rule(filters)
+    if rule.nil?
+      logger&.info "watched-ports: forward queue rule not found " \
+                   "(chain=forward, add-src-to-address-list, tag #{TAG.inspect})"
+      return
+    end
+
+    current = rule["dst-port"].to_s
+    if same_set?(current, desired)
+      logger&.debug "watched-ports: no change (#{desired.join(',')})"
+      return
+    end
+
+    desired_spec = desired.join(",")
+    logger&.info "watched-ports: #{current.empty? ? '(all dstnat)' : current} -> #{desired_spec}"
+    return if dry_run
+
+    api.talk(["/ip/firewall/filter/set",
+              "=.id=#{rule['.id']}",
+              "=dst-port=#{desired_spec}"])
+    logger&.info "watched-ports: forward queue rule updated"
+  end
+end
+
+# ============================================================================
 # Paths — config & patterns live in the SAME directory as this script,
 # unless overridden by env vars.
 # ============================================================================
@@ -168,6 +261,12 @@ CHECK_LIST  = config.fetch("check_list",  "domainblock-check")
 BANNED_LIST = config.fetch("banned_list", "domainblock-banned")
 BAN_TIMEOUT = config.fetch("ban_timeout", "7d")
 DNS_TIMEOUT = config.fetch("dns_timeout", 3).to_i
+
+# Watched-ports auto-management (forward/DSTNAT queue rule dst-port sync).
+# Enabled by default; set `watched_ports_manage: false` in config to turn off.
+WATCHED_MANAGE  = config.fetch("watched_ports_manage", true)
+WATCHED_EXCLUDE = config.fetch("exclude_ports", [])
+WATCHED_DRYRUN  = (ENV["DOMAINBLOCK_DRYRUN"] == "1")
 
 logger = Logger.new($stdout)
 logger.level = (ENV["DOMAINBLOCK_DEBUG"] == "1") ? Logger::DEBUG : Logger::INFO
@@ -275,6 +374,18 @@ begin
   end
 
   logger.info "Run complete: #{banned_now} new ban(s)"
+
+  # Keep the forward/DSTNAT queue rule's dst-port list in sync with tagged NAT.
+  if WATCHED_MANAGE
+    begin
+      WatchedPorts.reconcile(api,
+                             exclude_ports: WATCHED_EXCLUDE,
+                             logger: logger,
+                             dry_run: WATCHED_DRYRUN)
+    rescue RouterOS::Error => e
+      logger.warn "watched-ports: reconcile failed: #{e.message}"
+    end
+  end
 ensure
   api.close
 end
