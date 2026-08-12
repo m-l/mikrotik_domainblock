@@ -33,6 +33,17 @@ expire on their own timeout, and nothing on the router breaks. **Fail-open.**
 Legitimate users are never on `domainblock-banned`, so they never match the
 block rules at all — the rules are inert until the script bans something.
 
+> **Where your services live matters — read this before you configure.**
+> The recorder that feeds detection is an `add-src-to-address-list` rule. A rule
+> in the **input** chain only sees traffic that terminates **on the router
+> itself**. Services that run on another box (Home Assistant on a separate host,
+> Plex on a NAS, etc.) are reached via **DSTNAT port-forwarding**, and that
+> traffic traverses the **forward** chain, never input. So you need a queue rule
+> in **both** chains — input for anything hosted on the router, forward for
+> anything DSTNAT'd behind it. If you only add the input queue rule, scanners
+> hitting your forwarded services are never recorded, never looked up, and never
+> banned, even though the pattern would have matched. Section 1c adds both.
+
 ---
 
 ## Files (all in one folder)
@@ -69,22 +80,19 @@ a home directory** — see the permissions note in section 2.
 /ip service print where name=api
 ```
 
-(Plain API on 8728 sends the password in the clear over your LAN. For TLS, use
-`api-ssl` on 8729 and set `router_port: 8729` + `router_tls: true` in config.yml.)
+(Plain API on 8728 sends the password in the clear over your LAN. For TLS, use `api-ssl` on 8729 and set `router_port: 8729` + `router_tls: true` in config.yml.)
 
 ### 1c. Add the rules (IMPORTANT: do NOT use `place-before`)
 
-> **Lesson learned during install:** `place-before=[find where comment~"..."]`
-> repeatedly failed with *"invalid internal item number" / "no such item"*
-> because the `~` regex chokes on special characters in RouterOS comments
-> (commas, double spaces). **Add every rule plain, then position it with
-> `move` by number.** Exact-match `find` (`comment="..."` with `=`) works for
-> `move`; the regex `~` at add-time does not.
+> **Lesson learned during install:** `place-before=[find where comment~"..."]` repeatedly failed with *"invalid internal item number" / "no such item"* because the `~` regex chokes on special characters in RouterOS comments
+> (commas, double spaces). **Add every rule plain, then position it with `move` by number.** Exact-match `find` (`comment="..."` with `=`) works for `move`; the regex `~` at add-time does not.
 
-Add all six rules (they append at the bottom — that's fine, we move them next):
+Add all seven rules (they append at the bottom — that's fine, we move the
+order-sensitive ones next):
 
 ```
-/ip firewall filter add chain=input action=add-src-to-address-list address-list=domainblock-check address-list-timeout=1m in-interface-list=WAN connection-state=new protocol=tcp dst-port=8123,7277,3120,32400,5006,8080,8081,31011 comment="domainblock: queue new inbound for PTR check"
+/ip firewall filter add chain=input action=add-src-to-address-list address-list=domainblock-check address-list-timeout=1m in-interface-list=WAN connection-state=new protocol=tcp dst-port=8123,7277,3120,32400,5006,8080,8081,31011 comment="domainblock: queue new inbound (input) for PTR check"
+/ip firewall filter add chain=forward action=add-src-to-address-list address-list=domainblock-check address-list-timeout=1m in-interface-list=WAN connection-state=new connection-nat-state=dstnat protocol=tcp comment="domainblock: queue new inbound (forward/DSTNAT) for PTR check"
 /ip firewall filter add chain=input action=accept src-address-list=domainblock-banned protocol=udp dst-port=13231-13239,1194,1701,500,4500 comment="domainblock: allow WG/OpenVPN/L2TP even if banned"
 /ip firewall filter add chain=input action=accept src-address-list=domainblock-banned protocol=tcp dst-port=1723,8291 comment="domainblock: allow PPTP/Winbox even if banned"
 /ip firewall filter add chain=input action=accept src-address-list=domainblock-banned protocol=gre comment="domainblock: allow PPTP GRE even if banned"
@@ -92,23 +100,37 @@ Add all six rules (they append at the bottom — that's fine, we move them next)
 /ip firewall filter add chain=forward action=drop src-address-list=domainblock-banned in-interface-list=WAN comment="domainblock: drop matched IPs (forward)"
 ```
 
-Adjust the queue rule's `dst-port` to exactly the services you expose. The
-example set is: HA 8123, Bitwarden 7277, Linkwarden 3120, Plex 32400,
-WebDAV 5006, Kodi 8080/8081, MySQL 31011.
+**About the two queue rules:**
 
-### 1d. Position the rules with `move`
+- The **input** queue rule records scanners that hit a service **terminating on
+  the router itself** — anything you expose with an `input action=accept` rule.
+  Adjust its `dst-port` to exactly those ports. The example set is: HA 8123,
+  Bitwarden 7277, Linkwarden 3120, Plex 32400, WebDAV 5006, Kodi 8080/8081,
+  MySQL 31011 — but only the ones actually running *on* the router belong here.
+- The **forward** queue rule records scanners that hit a service **DSTNAT'd to
+  another host** (HA on a Proxmox box, Plex on a NAS, etc.). It deliberately has
+  **no `dst-port`** and matches on `connection-nat-state=dstnat` instead, so it
+  covers every forwarded service at once and won't silently miss a service if
+  you remap a port later. If a service is reached by port-forward, this is the
+  rule that catches its scanners — the input queue rule never will.
 
-Print the chain to get current numbers:
+Neither queue rule blocks anything (`add-src-to-address-list` only records), so
+their position in the chain doesn't matter. Only the VPN-accepts and the two
+drops are order-sensitive.
+
+### 1d. Position the order-sensitive rules with `move`
+
+Print the chains to get current numbers:
 
 ```
 /ip firewall filter print where chain=input
 /ip firewall filter print where chain=forward
 ```
 
-Then move by number (`move <rule#> destination=<target#>` places the rule
-*before* the target). Target ordering:
+Then move by number (`move <rule#> destination=<target#>` places the rule *before* the target). Target ordering:
 
 **Input chain**, top to bottom:
+
 1. (your existing `Blocked-External` drop, if any)
 2. domainblock VPN-accept — UDP (WG/OpenVPN/L2TP)
 3. domainblock VPN-accept — TCP (PPTP/Winbox)
@@ -117,14 +139,22 @@ Then move by number (`move <rule#> destination=<target#>` places the rule
 6. …then your service accepts, `accept established,related`, etc.
 
 > **Critical placement detail:** the input drop must sit **above your
-> per-service accept rules** (Bitwarden, Plex, Linkwarden, …), not merely above
-> `accept established,related`. If it sat below them, a banned IP hitting one of
+> per-service accept rules** (Bitwarden, Plex, Linkwarden, …), not merely above `accept established,related`. If it sat below them, a banned IP hitting one of
 > those service ports would be accepted before reaching the drop. Put it right
 > after your existing top-of-chain drop (e.g. `Blocked-External`). The three
 > VPN-accepts go immediately above the drop so the carve-out is evaluated first.
 
-**Forward chain:** the domainblock forward drop goes **above**
-`defconf: drop all from WAN not DSTNATed`.
+**Forward chain:** the domainblock forward drop goes **above** `defconf: drop all from WAN not DSTNATed`.
+
+> **Note on the forward drop and `established,related`:** most configs have
+> `defconf: accept established,related` high in the forward chain, above the
+> domainblock forward drop. That's fine — a banned IP's **new** connections
+> still hit the drop (new connections don't match established). The only residue
+> is that a single connection opened during the up-to-one-interval reactive
+> window rides `established,related` until it closes. For brute-force / scanner
+> traffic that's harmless, so leave the forward drop where the target ordering
+> puts it rather than moving it above the established-accept (moving it risks
+> tearing down legitimate forwarded sessions every time something is banned).
 
 Example moves (substitute your real numbers from the print):
 
@@ -144,6 +174,7 @@ before trusting it:
 
 ```
 /ip firewall filter print where chain=input
+/ip firewall filter print where chain=forward
 ```
 
 ---
@@ -154,11 +185,7 @@ No dependencies — stock Ruby 3.x has everything (socket, resolv, yaml, openssl
 
 ### Install location — use /opt, not your home directory
 
-> **Lesson learned:** running the service from `/home/<user>/...` fails with
-> `status=200/CHDIR — Changing to the requested working directory failed:
-> Permission denied`, because home directories are mode 700 and the unprivileged
-> `domainblock` service user can't traverse into them. Put the folder under
-> `/opt`.
+> **Lesson learned:** running the service from `/home/<user>/...` fails with `status=200/CHDIR — Changing to the requested working directory failed: Permission denied`, because home directories are mode 700 and the unprivileged `domainblock` service user can't traverse into them. Put the folder under `/opt`.
 
 ```
 sudo mv ./mikrotik_blockdomain /opt/domainblock    # or copy the folder there
@@ -170,8 +197,7 @@ directory traversable — but /opt is cleaner.)
 
 ### Configure
 
-Edit `config.yml` — set `router_host`, `router_pass` (and for API-SSL:
-`router_port: 8729` + `router_tls: true`).
+Edit `config.yml` — set `router_host`, `router_pass` (and for API-SSL: `router_port: 8729` + `router_tls: true`).
 
 ### Dry-run first (confirms the router login works)
 
@@ -212,11 +238,8 @@ directory — see the /opt note above.
 
 ## 3. Testing the pipeline end-to-end
 
-> **Gotcha:** don't test with `8.8.8.8` and pattern `*.dns.google`. `8.8.8.8`
-> reverse-resolves to the **bare** `dns.google` (no leading label), and `*`
-> requires at least one label — so it correctly does NOT match. That's the same
-> anchoring that stops suffix-spoofing; it's working as designed. Use a **bare**
-> pattern for that test IP:
+> **Gotcha:** don't test with `8.8.8.8` and pattern `*.dns.google`. `8.8.8.8` reverse-resolves to the **bare** `dns.google` (no leading label), and `*` requires at least one label — so it correctly does NOT match. That's the same
+> anchoring that stops suffix-spoofing; it's working as designed. Use a **bare** pattern for that test IP:
 
 ```
 # on the Linux box: add a matching pattern
@@ -244,6 +267,30 @@ Your real patterns (`*.googleusercontent.com`, etc.) match multi-label attacker
 PTRs like `189.167.182.34.bc.googleusercontent.com` correctly — that's the
 normal case; only the bare-hostname test IP needs a bare pattern.
 
+### Confirming the forward/DSTNAT path specifically
+
+If you run services behind the router (HA, Plex, etc.), test the forward path,
+not just input — the two are recorded by different rules:
+
+```
+# watch the service live
+journalctl -u domainblock.service -f
+```
+
+Trigger a hit against a **DSTNAT'd** service (or wait for a real scanner), then
+confirm the source IP first appears in `domainblock-check` and, within a run or
+two, lands in `domainblock-banned`:
+
+```
+/ip firewall address-list print where list=domainblock-check
+/ip firewall address-list print where list=domainblock-banned
+```
+
+If a scanner reaches a forwarded service but never shows up in either list, the
+forward queue rule (section 1c) is missing or disabled — that's the single most
+common reason a "banned" domain still gets through to a service that lives on
+another host.
+
 ---
 
 ## 4. Managing / operating
@@ -251,8 +298,7 @@ normal case; only the bare-hostname test IP needs a bare pattern.
 **Add / remove a block pattern:** edit `domainblock-patterns.txt`, one glob per
 line. No restart needed — the next run picks it up.
 
-Pattern syntax: `*` matches one or more DNS labels.
-`*.googleusercontent.com` matches `foo.bc.googleusercontent.com`, and is anchored
+Pattern syntax: `*` matches one or more DNS labels. `*.googleusercontent.com` matches `foo.bc.googleusercontent.com`, and is anchored
 at the end so `x.googleusercontent.com.evil.com` does NOT match.
 
 ```
@@ -284,15 +330,20 @@ run uninstall from wherever it now lives before deleting it.
 
 ## Notes / limitations
 
+- **Input vs forward:** the input queue rule only records traffic terminating on
+  the router; the forward queue rule records DSTNAT'd traffic to services on
+  other hosts. You need both. Omitting the forward rule is the usual cause of a
+  matching domain still reaching a service that lives behind the router (see
+  section 1c).
 - Catches hosts that HAVE a matching PTR — cloud scanners almost always do
-  (googleusercontent / amazonaws / etc.), which is exactly the target case.
-  Attackers on residential IPs with no PTR won't be caught by reverse-DNS
-  matching; IP-reputation tools (e.g. CrowdSec) are the complement for those.
+(googleusercontent / amazonaws / etc.), which is exactly the target case.
+Attackers on residential IPs with no PTR won't be caught by reverse-DNS
+matching; IP-reputation tools (e.g. CrowdSec) are the complement for those.
 - Reactive by up to one interval: a brand-new IP gets a connection or two
-  through before its next-run lookup bans it. Fine for brute-force attempts.
-- The queue rule (`add-src-to-address-list`) does not block — it only records,
-  so its position in the chain doesn't matter. Only the VPN-accepts and drops
-  are order-sensitive.
+through before its next-run lookup bans it. Fine for brute-force attempts.
+- The queue rules (`add-src-to-address-list`) do not block — they only record,
+so their position in the chain doesn't matter. Only the VPN-accepts and drops
+are order-sensitive.
 - RouterOS 7.x plaintext `/login` over the API channel: on 8728 the password
-  crosses your LAN in the clear. Enable API-SSL (8729, `router_tls: true`) to
-  encrypt it.
+crosses your LAN in the clear. Enable API-SSL (8729, `router_tls: true`) to
+encrypt it.
