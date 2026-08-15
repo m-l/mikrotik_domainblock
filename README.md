@@ -308,8 +308,37 @@ IP+domain comes from the script. Neither source alone has all three.
 Config keys (see section 2). To test:
 
 ```
-# force a refresh without waiting 60 runs:
-rm /tmp/domainblock-run-counter
+DOMAINBLOCK_DEBUG=1 ruby /opt/mikrotik_blockdomain/domainblock.rb   # look for "ban-cache: ..." lines
+cat /opt/mikrotik_blockdomain/ban-cache.txt                          # mirrors domainblock-banned
+
+# simulate a router reboot (clear bans), then restore:
+# on the router:  /ip firewall address-list remove [find list=domainblock-banned]
+DOMAINBLOCK_DEBUG=1 ruby /opt/mikrotik_blockdomain/domainblock.rb    # -> "ban-cache: restored N IP(s) from cache"
+```
+
+> ### ⚠️ systemd hardening must allow the cache + counter writes
+>
+> The service writes two files: `ban-cache.txt` (in the script dir) and the run
+> counter (default `/tmp/domainblock-run-counter`). A hardened unit will silently
+> block both — the writes are rescued and, because stdout is buffered under
+> systemd, produce no visible error. The service looks healthy while the cache
+> never updates (symptom: `ban-cache.txt` frozen while the router's banned list
+> grows). The generated unit **must** include:
+> ```ini
+> ProtectSystem=strict
+> PrivateTmp=no
+> ReadWritePaths=/opt/mikrotik_blockdomain /tmp
+> ```
+> and must **not** have `ReadOnlyPaths=/opt/mikrotik_blockdomain` (it contradicts
+> ReadWritePaths). `PrivateTmp=no` is required if the counter is in `/tmp` —
+> with `PrivateTmp=yes`, each run gets an isolated ephemeral `/tmp`, so the
+> counter never persists and the cache never comes due. Verify:
+> ```
+> systemctl show domainblock.service -p ReadWritePaths -p PrivateTmp
+> ```
+> Also ensure the script dir + cache file are owned by the service user
+> (`chown -R domainblock:domainblock /opt/mikrotik_blockdomain`) — the atomic
+> write needs directory write permission, not just file.
 DOMAINBLOCK_DEBUG=1 ruby /opt/domainblock/domainblock.rb   # look for "ban-cache: ..." lines
 cat /opt/domainblock/ban-cache.txt                          # mirrors domainblock-banned
 
