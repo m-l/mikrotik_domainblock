@@ -1,17 +1,25 @@
-# config.yml  — lives in the same directory as domainblock.rb
-# Connection + behaviour settings.
+# ── Router connection ──────────────────────────────────────────────
+router_host: 192.168.88.1          # your MikroTik's IP (set to yours)
+router_port: 8728                  # 8728 plain API, 8729 for API-SSL
+router_user: domainblock           # the API user you created
+router_pass: CHANGE_ME             # required — no default
+router_tls: false                  # true if using api-ssl on 8729
 
-# --- RouterOS connection ---
-router_host: "10.162.0.1"      # <-- your Mikrotik IP (the one the script can reach)
-router_port: 8728              # 8728 = plain API, 8729 = API-SSL (set router_tls: true)
-router_user: "domainblock"     # the restricted API user you created
-router_pass: "CHANGE_ME"       # <-- the domainblock user's password
-router_tls: false              # true if using API-SSL on 8729
+# ── Address lists ──────────────────────────────────────────────────
+check_list: domainblock-check      # queue list the firewall rules populate
+banned_list: domainblock-banned    # list the drop rules block
 
-# --- Address lists (must match the firewall rules on the router) ---
-check_list:  "domainblock-check"    # queue of new inbound IPs to reverse-look-up
-banned_list: "domainblock-banned"   # IPs whose PTR matched a pattern (drop rule uses this)
+# ── Ban behaviour ──────────────────────────────────────────────────
+ban_timeout: 10d                   # how long a ban lasts; default 10 days
+dns_timeout: 3                     # seconds per reverse-DNS lookup
 
-# --- Behaviour ---
-ban_timeout: "7d"    # how long a banned IP stays on the router before auto-expiring
-dns_timeout: 3       # seconds to wait per reverse-DNS lookup
+# ── Watched-ports auto-management (forward queue rule dst-port sync) ─
+watched_ports_manage: true         # false = leave the forward rule alone
+exclude_ports: []                  # force-exclude ports even if a tagged
+                                   # NAT rule has them, e.g. [8124]
+
+# ── Ban-cache persistence (survive router reboots + script restarts) ─
+ban_cache: true                    # false = disable the cache entirely
+ban_cache_file: ban-cache.txt      # relative to the script dir (/opt/...)
+ban_cache_every: 60                # refresh every N runs; 60 @30s = 30 min
+ban_cache_counter: /tmp/domainblock-run-counter   # cleared on Linux reboot
