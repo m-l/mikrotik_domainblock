@@ -18,6 +18,19 @@
 *.compute.amazonaws.com
 *.compute-1.amazonaws.com
 *.bc.googleusercontent.com
+*.stretchoid.com
+*.internet-measurement.com
+*.censys-scanner.com
+*.onyphe.net
+*.modat.io
+*.binaryedge.ninja
+*.internet-census.org
+*.shodan.io
+*.bufferover.run
+*.infrawat.ch
+*.deepfield.net
+*.linodeusercontent.com
+*.contaboserver.net
 
 # --- Add your own below, e.g. ---
 # *.digitalocean.com
