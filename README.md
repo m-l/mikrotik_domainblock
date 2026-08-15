@@ -287,6 +287,11 @@ Nth run (default 60 runs = 30 min), not every 30s. Because `/tmp` is cleared on 
 after a ha-linux reboot (or a service restart) immediately restores from cache.
 That covers both failure modes: router reboot **and** script restart.
 
+**First run / fresh install:** if `ban-cache.txt` doesn't exist yet, the run is
+forced due and the cache is **seeded from the router's current banned list**
+immediately — no waiting for the counter. So the cache is populated from whatever
+is already banned on the MikroTik the first time the script runs after install.
+
 **Tradeoff to know:** after a *router* reboot, the ban list stays empty until the
 next refresh comes due — up to `ban_cache_every × interval` (default 30 min).
 For cloud-scanner traffic that gap is harmless (they get re-detected live
