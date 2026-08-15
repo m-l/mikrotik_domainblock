@@ -259,7 +259,7 @@ ROUTER_TLS  = config.fetch("router_tls", false)
 
 CHECK_LIST  = config.fetch("check_list",  "domainblock-check")
 BANNED_LIST = config.fetch("banned_list", "domainblock-banned")
-BAN_TIMEOUT = config.fetch("ban_timeout", "7d")
+BAN_TIMEOUT = config.fetch("ban_timeout", "10d")   # ban length; default 10 days
 DNS_TIMEOUT = config.fetch("dns_timeout", 3).to_i
 
 # Watched-ports auto-management (forward/DSTNAT queue rule dst-port sync).
@@ -267,6 +267,17 @@ DNS_TIMEOUT = config.fetch("dns_timeout", 3).to_i
 WATCHED_MANAGE  = config.fetch("watched_ports_manage", true)
 WATCHED_EXCLUDE = config.fetch("exclude_ports", [])
 WATCHED_DRYRUN  = (ENV["DOMAINBLOCK_DRYRUN"] == "1")
+
+# Ban-cache persistence: survive router reboots (dynamic bans are wiped on
+# restart) and script restarts. The cache file on disk is the source of truth.
+# Restore refills the router from cache (blind — no PTR re-check); persist
+# rewrites the cache from the router's current banned list. Both run only every
+# Nth run, throttled by a counter in /tmp (cleared on Linux reboot, so the first
+# run after a Linux reboot is treated as due).
+BAN_CACHE_ON      = config.fetch("ban_cache", true)
+BAN_CACHE_FILE    = File.expand_path(config.fetch("ban_cache_file", "ban-cache.txt"), SCRIPT_DIR)
+BAN_CACHE_EVERY   = config.fetch("ban_cache_every", 60).to_i   # 60 runs @30s = 30 min
+BAN_CACHE_COUNTER = config.fetch("ban_cache_counter", "/tmp/domainblock-run-counter")
 
 logger = Logger.new($stdout)
 logger.level = (ENV["DOMAINBLOCK_DEBUG"] == "1") ? Logger::DEBUG : Logger::INFO
@@ -312,6 +323,96 @@ rescue Resolv::ResolvError, IOError, SystemCallError, Timeout::Error
 end
 
 # ============================================================================
+# BanCache — persist banned IPs across router reboots (dynamic address-list
+# entries are wiped on restart) and across script/service restarts.
+#
+#   restore(api): re-add cached IPs that aren't currently on the router's
+#                 banned list, with a FRESH ban_timeout and their cached PTR
+#                 comment. Blind — no PTR re-check. Runs BEFORE the ban pass so
+#                 a reboot-emptied router is refilled before persist reads it.
+#   persist(api): rewrite the cache from the router's current banned list.
+#                 Atomic (temp + rename). Manual unbans propagate out here.
+#
+# Cache line format:  <ip>\t<comment>
+# ============================================================================
+module BanCache
+  # Returns true if this run should refresh (restore+persist). Throttled by a
+  # counter in /tmp. Missing counter (e.g. after a Linux reboot) => due now.
+  def self.due?(counter_path, every)
+    every = 1 if every < 1
+    n = (File.exist?(counter_path) ? File.read(counter_path).to_i : 0) + 1
+    begin
+      File.write(counter_path, n.to_s)
+    rescue SystemCallError
+      # if /tmp isn't writable, treat every run as due rather than silently skip
+      return true
+    end
+    (n % every).zero?
+  end
+
+  def self.read_cache(path)
+    return {} unless File.exist?(path)
+    File.readlines(path).each_with_object({}) do |line, h|
+      ip, comment = line.chomp.split("\t", 2)
+      next if ip.nil? || ip.strip.empty?
+      h[ip.strip] = (comment || "")
+    end
+  rescue SystemCallError
+    {}
+  end
+
+  def self.write_cache(path, entries)
+    tmp = "#{path}.tmp.#{Process.pid}"
+    File.open(tmp, "w") do |f|
+      entries.each { |ip, comment| f.puts("#{ip}\t#{comment}") }
+    end
+    File.rename(tmp, path)   # atomic on same filesystem
+  rescue SystemCallError => e
+    File.delete(tmp) if File.exist?(tmp)
+    raise e
+  end
+
+  # Refill the router from cache. Only adds IPs not already banned.
+  def self.restore(api, banned_list:, timeout:, cache_file:, logger:)
+    cached = read_cache(cache_file)
+    return if cached.empty?
+
+    banned = api.talk(["/ip/firewall/address-list/print",
+                       "?list=#{banned_list}", "=.proplist=address"])
+    already = banned.map { |e| e["address"] }.compact.to_set
+
+    restored = 0
+    cached.each do |ip, comment|
+      next if already.include?(ip)
+      begin
+        api.talk(["/ip/firewall/address-list/add",
+                  "=list=#{banned_list}", "=address=#{ip}",
+                  "=timeout=#{timeout}",
+                  "=comment=#{comment.empty? ? "domainblock: restored from cache" : comment}"])
+        restored += 1
+      rescue RouterOS::Error => e
+        logger.debug "ban-cache: restore #{ip} skipped: #{e.message}"
+      end
+    end
+    logger.info "ban-cache: restored #{restored} IP(s) from cache" if restored.positive?
+  end
+
+  # Rewrite the cache to mirror the router's current banned list.
+  def self.persist(api, banned_list:, cache_file:, logger:)
+    banned = api.talk(["/ip/firewall/address-list/print",
+                       "?list=#{banned_list}",
+                       "=.proplist=address,comment"])
+    entries = banned.filter_map do |e|
+      ip = e["address"]
+      next if ip.nil? || ip.strip.empty?
+      [ip.strip, (e["comment"] || "").tr("\t\n", "  ")]
+    end
+    write_cache(cache_file, entries)
+    logger.debug "ban-cache: persisted #{entries.size} IP(s) to #{cache_file}"
+  end
+end
+
+# ============================================================================
 # Main
 # ============================================================================
 patterns = load_patterns(PATTERNS_PATH, logger)
@@ -327,6 +428,20 @@ rescue StandardError => e
 end
 
 begin
+  # Decide once whether this run refreshes the ban cache (restore + persist).
+  cache_due = BAN_CACHE_ON && BanCache.due?(BAN_CACHE_COUNTER, BAN_CACHE_EVERY)
+
+  # Restore BEFORE the ban pass so a reboot-emptied router is refilled first
+  # (and the later persist never overwrites the cache with an empty list).
+  if cache_due
+    begin
+      BanCache.restore(api, banned_list: BANNED_LIST, timeout: BAN_TIMEOUT,
+                       cache_file: BAN_CACHE_FILE, logger: logger)
+    rescue RouterOS::Error => e
+      logger.warn "ban-cache: restore failed: #{e.message}"
+    end
+  end
+
   check = api.talk(["/ip/firewall/address-list/print",
                     "?list=#{CHECK_LIST}", "=.proplist=address"])
   banned = api.talk(["/ip/firewall/address-list/print",
@@ -384,6 +499,19 @@ begin
                              dry_run: WATCHED_DRYRUN)
     rescue RouterOS::Error => e
       logger.warn "watched-ports: reconcile failed: #{e.message}"
+    end
+  end
+
+  # Persist the router's current banned list back to the cache (same cadence as
+  # restore). Runs AFTER the ban pass so newly-added bans are captured, and
+  # after restore so the cache is never overwritten with a post-reboot-empty
+  # list. Manual unbans propagate out of the cache here.
+  if cache_due
+    begin
+      BanCache.persist(api, banned_list: BANNED_LIST,
+                       cache_file: BAN_CACHE_FILE, logger: logger)
+    rescue RouterOS::Error, SystemCallError => e
+      logger.warn "ban-cache: persist failed: #{e.message}"
     end
   end
 ensure
