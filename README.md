@@ -11,6 +11,10 @@ The script also keeps the forward/DSTNAT queue rule's watched-port list in sync
 with the services you deliberately forward (see **Watched-ports auto-management**
 below), so you don't hand-edit ports as you add or remove port-forwards.
 
+Bans are cached to disk and survive both router reboots and script restarts (see
+**Ban-cache persistence** below) — the MikroTik's dynamic address-list is wiped
+on restart, so without the cache a scheduled reboot would empty your ban list.
+
 No Docker, no CrowdSec, no gems — the script talks the RouterOS API directly
 using only Ruby's standard library. Everything lives self-contained in one
 install directory.
@@ -33,6 +37,9 @@ new inbound IP -> router adds it to "domainblock-check" (1 min timeout)
 The router does the enforcement; the script only decides membership. If the
 Linux box is down, the script simply stops adding new bans — existing bans
 expire on their own timeout, and nothing on the router breaks. **Fail-open.**
+Bans that existed before a router reboot are restored from the on-disk cache on
+the next refresh run (see section 1f), so a scheduled reboot doesn't permanently
+lose them.
 
 Legitimate users are never on `domainblock-banned`, so they never match the
 block rules at all — the rules are inert until the script bans something.
@@ -56,8 +63,9 @@ block rules at all — the rules are inert until the script bans something.
 
 ```
 domainblock.rb               the script (reads config + patterns from its own dir)
-config.yml                   router IP, credentials, list names, timeouts, watched-ports opts
+config.yml                   router IP, credentials, list names, timeouts, watched-ports + ban-cache opts
 domainblock-patterns.txt     your block patterns — the thing you edit
+ban-cache.txt                auto-generated: banned IPs snapshot (survives reboots); do not edit while running
 install.sh                   sets up the systemd service + timer
 uninstall.sh                 removes them
 README.md                    this file
@@ -249,6 +257,65 @@ backwards and the queue silently matches nothing.
 
 ---
 
+## 1f. Ban-cache persistence (surviving reboots)
+
+MikroTik `domainblock-banned` entries are **dynamic address-list entries with a
+timeout** — they live in RAM and are **wiped on every router reboot**. If you run
+a scheduled reboot (common on RouterOS, e.g. weekly), your ban list is emptied
+each time and has to rebuild from scratch. The ban cache fixes this.
+
+**How it works:** the script keeps a plain-text cache of the banned set on the
+Linux box (`ban-cache.txt` in the script dir). The cache is the source of truth
+and outlives both the router and the script:
+
+- **Restore** — re-adds any cached IP that isn't currently on the router's banned
+  list, with a **fresh** `ban_timeout` and its original matched-PTR comment. This
+  refills the router after a reboot. Restore is **blind** — it trusts the cache
+  and does not re-run the PTR lookup, so it's fast.
+- **Persist** — rewrites the cache from the router's current banned list
+  (atomic temp-file + rename). New bans are captured; IPs you manually unban drop
+  out of the cache on the next persist.
+
+**Ordering matters and is handled for you:** restore runs **before** the ban
+pass, persist runs **after**. So a reboot-emptied router is refilled from cache
+*before* the persist step reads the list — the cache is never overwritten with a
+momentarily-empty post-reboot list.
+
+**Throttled by a run counter** in `/tmp` so the cache work only happens every
+Nth run (default 60 runs = 30 min), not every 30s. Because `/tmp` is cleared on a
+**Linux** reboot, a missing counter is treated as "due now" — so the first run
+after a ha-linux reboot (or a service restart) immediately restores from cache.
+That covers both failure modes: router reboot **and** script restart.
+
+**Tradeoff to know:** after a *router* reboot, the ban list stays empty until the
+next refresh comes due — up to `ban_cache_every × interval` (default 30 min).
+For cloud-scanner traffic that gap is harmless (they get re-detected live
+anyway). Lower `ban_cache_every` if you want a shorter refill window at the cost
+of two extra API calls per refresh.
+
+**What the cache does *not* store:** the attack **port**. The script only ever
+reads source **IPs** from `domainblock-check` (the queue rules record the IP, not
+the port). The port exists only in the firewall log line (`dblock-fwd …:8123`),
+never in the address-list the script sees — so the cache holds IP + matched PTR,
+never a port. IP+port together comes only from remote syslog of the queue rules;
+IP+domain comes from the script. Neither source alone has all three.
+
+Config keys (see section 2). To test:
+
+```
+# force a refresh without waiting 60 runs:
+rm /tmp/domainblock-run-counter
+DOMAINBLOCK_DEBUG=1 ruby /opt/domainblock/domainblock.rb   # look for "ban-cache: ..." lines
+cat /opt/domainblock/ban-cache.txt                          # mirrors domainblock-banned
+
+# simulate a router reboot (clear bans), then restore:
+# on the router:  /ip firewall address-list remove [find list=domainblock-banned]
+rm /tmp/domainblock-run-counter
+DOMAINBLOCK_DEBUG=1 ruby /opt/domainblock/domainblock.rb    # -> "ban-cache: restored N IP(s) from cache"
+```
+
+---
+
 ## 2. Linux box setup
 
 No dependencies — stock Ruby 3.x has everything (socket, resolv, yaml, openssl).
@@ -271,13 +338,22 @@ directory traversable — but /opt is cleaner.)
 ### Configure
 
 Edit `config.yml` — set `router_host`, `router_pass` (and for API-SSL:
-`router_port: 8729` + `router_tls: true`). Watched-ports options:
+`router_port: 8729` + `router_tls: true`). Watched-ports and ban-cache options:
 
 ```yaml
+# --- ban length ---
+ban_timeout: 10d                # how long a ban lasts; default 10 days
+
 # --- watched-ports auto-management (forward queue rule dst-port sync) ---
 watched_ports_manage: true      # default true; set false to leave the rule alone
 exclude_ports: []               # ports to force-exclude even if a tagged NAT rule has them
                                 # e.g. exclude_ports: [8124]
+
+# --- ban-cache persistence (survive router reboots + script restarts) ---
+ban_cache: true                             # default true
+ban_cache_file: ban-cache.txt               # snapshot, relative to script dir
+ban_cache_every: 60                         # refresh (restore+persist) every N runs; 60 @30s = 30 min
+ban_cache_counter: /tmp/domainblock-run-counter   # cleared on Linux reboot => first run after reboot restores
 ```
 
 ### Dry-run first (confirms login + shows the computed port set, writes nothing)
@@ -414,6 +490,16 @@ forward queue rule's `dst-port` on the next run.
 journalctl -u domainblock.service -f
 ```
 
+**Manually unbanning:** removing an IP from `domainblock-banned` on the router is
+enough — on the next cache refresh (persist), it drops out of `ban-cache.txt`
+too, so it won't be restored. If you unban an IP and it keeps coming back
+*within* a refresh window, wait for the next refresh or clear it from the cache
+file directly (`ban-cache.txt` in the script dir) and delete
+`/tmp/domainblock-run-counter` to force a refresh.
+
+**Force a ban-cache refresh now:** `rm /tmp/domainblock-run-counter`; the next
+run restores + persists regardless of the counter.
+
 ---
 
 ## 5. Uninstall
@@ -433,6 +519,9 @@ the two address-lists, and strip the `#domainblock` tag from your NAT rules
 /ip firewall address-list remove [find list=domainblock-check]
 /ip firewall address-list remove [find list=domainblock-banned]
 ```
+
+The ban cache and run counter are local files; remove them if you want a clean
+slate: `rm -f ban-cache.txt /tmp/domainblock-run-counter`.
 
 ---
 
@@ -456,6 +545,15 @@ the two address-lists, and strip the `#domainblock` tag from your NAT rules
   matching; IP-reputation tools (e.g. CrowdSec) are the complement for those.
 - **Reactive by up to one interval:** a brand-new IP gets a connection or two
   through before its next-run lookup bans it. Fine for brute-force attempts.
+- **Bans are dynamic and RAM-only on the router** — wiped on reboot. The ban
+  cache (section 1f) restores them on the next refresh run, so a scheduled
+  reboot doesn't lose them, but there's an up-to-`ban_cache_every`-interval gap
+  after a router reboot before the list is refilled (default ~30 min).
+- **The script never sees the attack port.** It reads only source IPs from
+  `domainblock-check`; the port lives solely in the firewall log line
+  (`dblock-fwd …->host:port`). So bans, the cache, and PTR analysis are all
+  IP-based. To see which port was hit, ship the queue-rule logs to a syslog host
+  (see the remote-logging notes) — that's the only source of IP+port.
 - The queue rules (`add-src-to-address-list`) do not block — they only record,
   so their position in the chain doesn't matter. Only the VPN-accepts and drops
   are order-sensitive.
