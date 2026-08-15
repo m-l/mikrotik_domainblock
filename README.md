@@ -388,6 +388,10 @@ ban_cache: true                             # default true
 ban_cache_file: ban-cache.txt               # snapshot, relative to script dir
 ban_cache_every: 60                         # refresh (restore+persist) every N runs; 60 @30s = 30 min
 ban_cache_counter: /tmp/domainblock-run-counter   # cleared on Linux reboot => first run after reboot restores
+
+# --- recon log: find NEW domains to ban ---
+seen_log: false                 # true = record every candidate's PTR verdict to a CSV
+seen_log_file: seen.csv         # relative to script dir; grows over time (rotate it)
 ```
 
 ### Dry-run first (confirms login + shows the computed port set, writes nothing)
@@ -533,6 +537,43 @@ file directly (`ban-cache.txt` in the script dir) and delete
 
 **Force a ban-cache refresh now:** `rm /tmp/domainblock-run-counter`; the next
 run restores + persists regardless of the counter.
+
+### Finding new domains to ban (recon log)
+
+Scanners come from far more than AWS and Google — Censys, Shodan, Onyphe,
+BinaryEdge, Stretchoid, Linode, Contabo and others scan constantly. To discover
+which providers are hitting you that your patterns *don't* yet catch, enable the
+recon log (`seen_log: true` in config). The script then records every
+candidate's PTR verdict to `seen.csv` — using the reverse-DNS it already looks up
+during the normal run, so no extra DNS work:
+
+```
+timestamp,ip,ptr,verdict          # verdict = banned | no-match | no-ptr
+```
+
+The `no-match` rows are the gold: IPs that connected but **weren't** banned —
+exactly the candidates to consider. Tally their domain suffixes:
+
+```
+awk -F, '$4=="no-match"{print $3}' /opt/mikrotik_blockdomain/seen.csv \
+  | sed -E 's/^[^.]+\.//' | sort | uniq -c | sort -rn | head -30
+```
+
+A cloud/scanner provider trending near the top is a pattern worth adding to
+`domainblock-patterns.txt`. `no-ptr` rows are IPs with no reverse-DNS at all —
+they can't be caught by this tool (use IP-reputation like CrowdSec for those).
+
+Common scanner suffixes worth blocking once you see them: `*.censys-scanner.com`,
+`*.shodan.io`, `*.onyphe.net`, `*.binaryedge.ninja`, `*.stretchoid.com`,
+`*.internet-measurement.com`, `*.modat.io`, `*.internet-census.org`,
+`*.bufferover.run`, `*.linodeusercontent.com`, `*.contaboserver.net`. Do NOT
+blanket-block residential/ISP suffixes (e.g. a national telco) — those may be
+legitimate users or your own backup WAN.
+
+`seen.csv` grows over time; rotate it (e.g. a weekly logrotate entry, or
+`: > seen.csv` after reviewing). Without the recon log you can still spot
+patterns by reverse-resolving the syslog feed, but that re-does hundreds of DNS
+lookups each time — the recon log captures them once, for free.
 
 ---
 
