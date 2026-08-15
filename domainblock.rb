@@ -23,6 +23,13 @@ require "set"
 require "openssl"
 require "timeout"
 
+# Flush logs immediately. Under systemd, stdout/stderr are pipes (block-buffered
+# by default), so without this the tail of each run — watched-ports and
+# ban-cache lines — is written but not flushed before a Type=oneshot process
+# exits, making a working run look like it stopped after "Run complete".
+$stdout.sync = true
+$stderr.sync = true
+
 # ============================================================================
 # Minimal RouterOS API client (pure stdlib)
 # The RouterOS API is a stream of "sentences"; each sentence is a list of
