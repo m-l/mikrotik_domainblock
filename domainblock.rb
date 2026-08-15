@@ -286,6 +286,13 @@ BAN_CACHE_FILE    = File.expand_path(config.fetch("ban_cache_file", "ban-cache.t
 BAN_CACHE_EVERY   = config.fetch("ban_cache_every", 60).to_i   # 60 runs @30s = 30 min
 BAN_CACHE_COUNTER = config.fetch("ban_cache_counter", "/tmp/domainblock-run-counter")
 
+# Recon log: append every candidate's PTR-lookup verdict to a CSV so you can
+# spot NEW attacker domain clusters that aren't in your patterns yet. Records
+# the PTR the script already computes (no extra DNS). Off by default.
+# Format:  timestamp,ip,ptr,verdict   (verdict = banned | no-match | no-ptr)
+SEEN_LOG_ON   = config.fetch("seen_log", false)
+SEEN_LOG_FILE = SEEN_LOG_ON ? File.expand_path(config.fetch("seen_log_file", "seen.csv"), SCRIPT_DIR) : nil
+
 logger = Logger.new($stdout)
 logger.level = (ENV["DOMAINBLOCK_DEBUG"] == "1") ? Logger::DEBUG : Logger::INFO
 logger.formatter = proc { |sev, time, _p, msg| "#{time.strftime('%Y-%m-%d %H:%M:%S')} #{sev} #{msg}\n" }
@@ -327,6 +334,17 @@ def reverse_lookup(ip, timeout)
   end
 rescue Resolv::ResolvError, IOError, SystemCallError, Timeout::Error
   []
+end
+
+# Append one recon record. Best-effort: never let a logging failure disrupt the
+# ban pass. ptr may be empty (no-ptr). Commas/newlines in the PTR are sanitised.
+def seen_log_append(path, ip, ptr, verdict)
+  return if path.nil?
+  safe_ptr = ptr.to_s.tr(",\n\r", "   ").strip
+  line = "#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')},#{ip},#{safe_ptr},#{verdict}\n"
+  File.open(path, "a") { |f| f.write(line) }
+rescue SystemCallError
+  nil
 end
 
 # ============================================================================
@@ -476,12 +494,14 @@ begin
     names = reverse_lookup(ip, DNS_TIMEOUT)
     if names.empty?
       logger.debug "#{ip} -> (no PTR)"
+      seen_log_append(SEEN_LOG_FILE, ip, "", "no-ptr") if SEEN_LOG_ON
       next
     end
 
     match = names.find { |n| hostname_matches?(n, patterns) }
     unless match
       logger.debug "#{ip} -> #{names.join(', ')} (no match)"
+      seen_log_append(SEEN_LOG_FILE, ip, names.first, "no-match") if SEEN_LOG_ON
       next
     end
 
@@ -492,6 +512,7 @@ begin
                 "=timeout=#{BAN_TIMEOUT}", "=comment=#{comment}"])
       banned_now += 1
       logger.info "BANNED #{ip} (PTR #{match})"
+      seen_log_append(SEEN_LOG_FILE, ip, match, "banned") if SEEN_LOG_ON
     rescue RouterOS::Error => e
       if e.message.include?("already have")
         logger.debug "#{ip} already banned"
