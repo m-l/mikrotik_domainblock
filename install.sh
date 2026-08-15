@@ -83,7 +83,7 @@ ExecStart=$RUBY_BIN $INSTALL_DIR/domainblock.rb
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-PrivateTmp=true
+PrivateTmp=no
 ReadWritePaths=
 ReadOnlyPaths=$INSTALL_DIR
 EOF
