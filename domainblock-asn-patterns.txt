@@ -15,7 +15,11 @@
 #                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # so *NextGenWebs* matches that whole line.
 #
-# Lines starting with '#' and blank lines are ignored.
+# Lines starting with '#' and blank lines are ignored. Put comments on their
+# OWN line, above the pattern they explain — never after it on the same
+# line. The loader only skips a line that STARTS with '#'; it does not strip
+# trailing comments, so "*UCLOUD*  # some note" is parsed as one single
+# pattern including the comment text and will never match anything.
 # Edit this file freely — no restart needed; the next run picks it up.
 #
 # Turn on `seen_log: true` in config.yml first and watch seen.csv for a
@@ -28,7 +32,7 @@
 *GOOGLE-CLOUD*
 *MICROSOFT-CORP*
 *ALIBABA*
-*ORACLE-*-ASN*
+*ORACLE*
 
 # --- VPS / hosting providers commonly used for scanning ---
 *HETZNER*
@@ -39,6 +43,22 @@
 *CONTABO*
 *SCALEWAY*
 *M247*
+
+# --- Confirmed against seen.csv 2026-08-16..2026-09-05 (no-ptr bucket) ---
+# Small/opaque VPS resellers with no legitimate reason to reach a home
+# network — real hits, no plausible false-positive downside.
+# AS135377, UCLOUD INFORMATION TECHNOLOGY (HK) LIMITED
+*UCLOUD*
+# AS202412, Omegatech LTD (SC)
+*OMEGATECH*
+# AS219502, Storm Industries LLC (US)
+*STORMCLOUD*
+# AS209605, UAB Host Baltic (LT)
+*HOSTBALTIC*
+# AS215925, VPSVAULT.HOST LTD (GB)
+*VPSVAULTHOST*
+# AS197170, TechTies Inc. (SC)
+*TECHTIES*
 
 # --- Add your own below as you spot them in seen.csv, e.g. ---
 # *NextGenWebs*
