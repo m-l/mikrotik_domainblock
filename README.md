@@ -20,6 +20,12 @@ Optionally, the script can also ban by **ASN / hosting-provider name** (see
 datacenter IPs that have no PTR record at all, which reverse-DNS matching
 structurally cannot see.
 
+An optional monthly report (see **Monthly pattern-coverage report** below)
+diffs what actually hit you against your current pattern files and emails
+what's not yet covered — including a persistence check across everything
+logrotate is still keeping, which is what catches a source that paces its
+attempts specifically to avoid ranking high in any single month.
+
 No Docker, no CrowdSec, no gems — the script talks the RouterOS API directly
 using only Ruby's standard library. Everything lives self-contained in one
 install directory.
@@ -67,14 +73,17 @@ block rules at all — the rules are inert until the script bans something.
 ## Files (all in one folder)
 
 ```
-domainblock.rb               the script (reads config + patterns from its own dir)
-config.yml                   router IP, credentials, list names, timeouts, watched-ports + ban-cache opts
-domainblock-patterns.txt     your PTR block patterns — the thing you edit
-domainblock-asn-patterns.txt your ASN/datacenter block patterns (optional, asn_check: true)
-ban-cache.txt                auto-generated: banned IPs snapshot (survives reboots); do not edit while running
-install.sh                   sets up the systemd service + timer
-uninstall.sh                 removes them
-README.md                    this file
+domainblock.rb                the script (reads config + patterns from its own dir)
+domainblock-monthly-report.rb optional: emails a monthly pattern-coverage report (monthly_report: true)
+config.yml                    router IP, credentials, list names, timeouts, watched-ports + ban-cache opts
+domainblock-patterns.txt      your PTR block patterns — the thing you edit
+domainblock-asn-patterns.txt  your ASN/datacenter block patterns (optional, asn_check: true)
+ban-cache.txt                 auto-generated: banned IPs snapshot (survives reboots); do not edit while running
+seen.csv                      auto-generated if seen_log: true; logrotate (installed by install.sh) rolls
+                              it into seen.csv-YYYY-MM[.gz] monthly, 6 kept
+install.sh                    sets up the systemd services + timers + logrotate drop-in
+uninstall.sh                  removes them
+README.md                     this file
 ```
 
 The script resolves `config.yml` and `domainblock-patterns.txt` from its own
@@ -588,10 +597,17 @@ Common scanner suffixes worth blocking once you see them: `*.censys-scanner.com`
 blanket-block residential/ISP suffixes (e.g. a national telco) — those may be
 legitimate users or your own backup WAN.
 
-`seen.csv` grows over time; rotate it (e.g. a weekly logrotate entry, or
-`: > seen.csv` after reviewing). Without the recon log you can still spot
-patterns by reverse-resolving the syslog feed, but that re-does hundreds of DNS
-lookups each time — the recon log captures them once, for free.
+`seen.csv` rotation is handled for you — `install.sh` drops in
+`/etc/logrotate.d/domainblock` (monthly, 6 kept, compressed) the first time you
+run it, so there's no manual truncation to remember. Without the recon log you
+can still spot patterns by reverse-resolving the syslog feed, but that re-does
+hundreds of DNS lookups each time — the recon log captures them once, for free.
+
+Doing this by hand with `awk` (above) is fine for an on-demand check, but it
+only ever looks at whichever single file you point it at, and won't notice a
+source that never has enough volume in one month to catch your eye. See
+**Monthly pattern-coverage report** below for the automated, multi-month
+version of this same idea.
 
 ### Optional: block by datacenter/ASN too
 
@@ -638,6 +654,70 @@ carry a matching PTR, so this mainly closes the no-PTR gap and gives
 defense-in-depth for the providers you specifically list. It's also not
 country-level GeoIP blocking; it identifies the network operator, not the
 country, which is what "block this datacenter" actually calls for.
+
+### Optional: monthly pattern-coverage report (mechanical, emailed)
+
+Set `monthly_report: true` in `config.yml` and `domainblock-monthly-report.rb`
+runs automatically on its own systemd timer (installed by `install.sh`, fires
+the 3rd of each month — a couple days after logrotate's own daily cron, so
+there's always a completed archive to read). It re-does the `awk`-based recon
+workflow above for you every month and emails only what's genuinely new:
+
+- **This month, by volume** — top PTR suffixes and ASN names NOT already in
+  `domainblock-patterns.txt` / `domainblock-asn-patterns.txt`, ranked by hit
+  count, same as the manual `awk` workflow above.
+- **Persistent, across everything logrotate is still keeping** (up to 6
+  months) — sources seen on many separate **days**, ranked by day-count
+  rather than volume. This is the one the volume list structurally can't
+  provide: a source that only ever sends a handful of hits, but comes back
+  every few days for months, never ranks near the top of any single month's
+  totals — an attacker deliberately pacing attempts to stay under exactly that
+  radar. `report_persistent_min_days` (default 3) sets how many distinct days
+  before something gets flagged this way.
+
+Both sections stay mechanical, same spirit as the recon log itself: it tells
+you what's new and how big it is, not whether it's safe to block. A benign
+self-identifying scanner and a bulletproof host can look identical in these
+numbers — deciding between them still takes an actual look, the same way it
+did when you found `security.ipip.net` or `visionheight.com` by hand.
+
+**Config needed** (`config.yml`):
+
+```yaml
+monthly_report: false                # true = enable
+report_top_n: 20                     # how many items per section
+report_persistent_min_days: 3        # distinct-day threshold for the persistence sections
+report_smtp_host: smtp.example.com
+report_smtp_port: 587
+report_smtp_user: reports@example.com
+report_smtp_pass: CHANGE_ME
+report_smtp_starttls: true
+report_from: "domainblock@yourhost"   # for Gmail: must match report_smtp_user, see below
+report_to: "you@example.com"          # comma-separate for multiple recipients
+```
+
+Requires `seen_log: true` (previous section) and at least one rotated archive
+to exist — it never reads the live, still-growing `seen.csv`.
+
+**Test it without waiting for a real rotation or sending real mail:**
+
+```
+DOMAINBLOCK_REPORT_ARCHIVE=/opt/domainblock/seen.csv DOMAINBLOCK_DRYRUN=1 DOMAINBLOCK_DEBUG=1 \
+  ruby /opt/domainblock/domainblock-monthly-report.rb
+```
+
+`DOMAINBLOCK_REPORT_ARCHIVE` points the script at any file directly — the live
+`seen.csv` included — instead of searching for a rotated `seen.csv-YYYY-MM`.
+`DOMAINBLOCK_DRYRUN=1` prints the report instead of emailing it. Drop the
+dry-run flag once your SMTP settings are real to confirm actual delivery.
+
+> **Lesson learned: Gmail rejects a From address it doesn't recognize.**
+> `Net::SMTPFatalError: 555 5.5.2 Syntax error` from Gmail's relay almost
+> always means `report_from` doesn't match (or belong to) the account
+> authenticated as `report_smtp_user` — Gmail phrases this as a generic syntax
+> error, but it's really an address-identity check. Set `report_from` to the
+> exact same address as `report_smtp_user` (a real Gmail address, or a verified
+> alias on that account), not an arbitrary placeholder domain.
 
 ---
 
@@ -706,3 +786,8 @@ slate: `rm -f ban-cache.txt /tmp/domainblock-run-counter`.
 - RouterOS 7.x plaintext `/login` over the API channel: on 8728 the password
   crosses your LAN in the clear. Enable API-SSL (8729, `router_tls: true`) to
   encrypt it.
+- **The monthly report's persistence check is bounded by retention.** It reads
+  every archive logrotate is still keeping (6 months by default), so an
+  attacker pacing attempts further apart than that window is invisible to it,
+  same as it's invisible to everything else here. Raising `rotate` in the
+  logrotate config extends the window at the cost of more disk.

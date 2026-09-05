@@ -18,19 +18,43 @@
 *.compute.amazonaws.com
 *.compute-1.amazonaws.com
 *.bc.googleusercontent.com
-*.stretchoid.com
-*.internet-measurement.com
-*.censys-scanner.com
-*.onyphe.net
-*.modat.io
-*.binaryedge.ninja
-*.internet-census.org
-*.shodan.io
-*.bufferover.run
-*.infrawat.ch
-*.deepfield.net
 *.linodeusercontent.com
 *.contaboserver.net
+
+# --- Confirmed against seen.csv 2026-08-16..2026-09-05 (no-match bucket) ---
+*.security.ipip.net
+*.labs.rapid7.com
+*.hostwindsdns.com
+*.group-ib.com
+*.gino-research.net.in.tum.de
+*.sysnet.ucsd.edu
+*.intrinsec.com
+*.rev.poneytelecom.eu
+*.members.linode.com
+*.cdn77.com
+*.colocrossing.com
+*.hosted-by-itldc.com
+
+# --- Self-identifying benign scanners (opt-out available) — commented out
+# on purpose. These publish who they are and honor removal requests, so
+# blocking them mostly costs you your own visibility into your exposure
+# rather than stopping anything malicious. Uncomment any of these if you'd
+# still rather not be scanned by them at all — that's a legitimate choice,
+# just a different one than "this is a threat."
+#*.stretchoid.com
+#*.internet-measurement.com
+#*.censys-scanner.com
+#*.onyphe.net
+#*.modat.io
+#*.binaryedge.ninja
+#*.internet-census.org
+#*.shodan.io
+#*.bufferover.run
+#*.infrawat.ch
+#*.deepfield.net
+#*.scanning.silentpush.com
+#*.scanning.cybcube.com
+#*.visionheight.com
 
 # --- Add your own below, e.g. ---
 # *.digitalocean.com

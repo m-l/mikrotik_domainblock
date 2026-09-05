@@ -30,3 +30,31 @@ ban_cache: true                    # false = disable the cache entirely
 ban_cache_file: ban-cache.txt      # relative to the script dir (/opt/...)
 ban_cache_every: 60                # refresh every N runs; 60 @30s = 30 min
 ban_cache_counter: /tmp/domainblock-run-counter   # cleared on Linux reboot
+
+# ── Monthly pattern-coverage report (mechanical, emailed) ────────────
+# Diffs each month's rotated seen.csv against your current pattern files and
+# emails only what's NOT already covered, ranked by hit volume. This is a
+# mechanical coverage report, not a verdict -- deciding whether something is
+# safe to add still takes an actual look. Requires seen_log: true above and
+# the logrotate drop-in (see install.sh) so there's a rotated archive to read.
+monthly_report: false              # true = enable the monthly report
+report_subject: "domainblock monthly report - %{month}"   # used for the email
+                                    # Subject and the report's own opening line;
+                                    # %{month} is replaced with e.g. 2026-08.
+                                    # Keep this plain ASCII -- Gmail (and some
+                                    # other relays) reject unencoded non-ASCII
+                                    # characters in a Subject header.
+report_top_n: 20                   # how many new suffixes/ASNs to list per section
+report_persistent_min_days: 3       # flag anything seen on this many distinct
+                                    # days across ALL kept archives (up to 6
+                                    # months), even if total volume is tiny --
+                                    # catches attackers pacing attempts to
+                                    # avoid ranking near the top by volume
+report_smtp_host: smtp.example.com
+report_smtp_port: 587
+report_smtp_user: reports@example.com
+report_smtp_pass: CHANGE_ME
+report_smtp_starttls: true
+report_from: "domainblock@yourhost"
+report_to: "you@example.com"
+

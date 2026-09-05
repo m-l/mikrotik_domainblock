@@ -103,10 +103,68 @@ Unit=domainblock.service
 [Install]
 WantedBy=timers.target
 EOF
+# --- logrotate: seen.csv, monthly, 6 kept ------------------------------------
+# Safe regardless of whether seen_log is enabled in config.yml — logrotate's
+# own `missingok` just skips a file that doesn't exist. No coordination with
+# the running script needed: domainblock.rb opens seen.csv fresh (File.open
+# "a") on every 30s tick rather than holding it open, so logrotate can rename
+# it out from under the script at any moment and the next tick just creates a
+# new empty file at that path.
+LOGROTATE_FILE="/etc/logrotate.d/domainblock"
+echo ">> Writing $LOGROTATE_FILE (monthly, 6 kept)"
+cat > "$LOGROTATE_FILE" <<EOF
+$INSTALL_DIR/seen.csv {
+    monthly
+    rotate 6
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y-%m
+    compress
+    create 640 $SERVICE_USER $SERVICE_USER
+}
+EOF
+# --- optional monthly coverage-report timer ----------------------------------
+# Installed unconditionally (like the other opt-in features), but the script
+# itself checks `monthly_report` in config.yml and exits immediately if it's
+# not set to true, so this is a no-op until you turn it on there.
+REPORT_SERVICE_FILE="/etc/systemd/system/domainblock-report.service"
+REPORT_TIMER_FILE="/etc/systemd/system/domainblock-report.timer"
+echo ">> Writing $REPORT_SERVICE_FILE / $REPORT_TIMER_FILE (3rd of each month)"
+cat > "$REPORT_SERVICE_FILE" <<EOF
+[Unit]
+Description=domainblock - monthly pattern-coverage report (no-op unless monthly_report: true)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$RUBY_BIN $INSTALL_DIR/domainblock-monthly-report.rb
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$INSTALL_DIR
+EOF
+cat > "$REPORT_TIMER_FILE" <<EOF
+[Unit]
+Description=Run the domainblock monthly coverage report
+[Timer]
+# 3rd of each month, not the 1st — gives logrotate's daily cron a full
+# buffer to have already rotated last month's seen.csv by the time this runs.
+OnCalendar=*-*-03 04:00:00
+AccuracySec=1h
+Persistent=true
+Unit=domainblock-report.service
+[Install]
+WantedBy=timers.target
+EOF
 # --- enable -----------------------------------------------------------------
-echo ">> Reloading systemd and enabling timer"
+echo ">> Reloading systemd and enabling timers"
 systemctl daemon-reload
 systemctl enable --now domainblock.timer
+systemctl enable --now domainblock-report.timer
 echo ""
 echo "Done. domainblock is installed and the timer is active."
 echo ""
@@ -115,6 +173,12 @@ echo "  Run once now         : sudo systemctl start domainblock.service"
 echo "  Watch logs           : journalctl -u domainblock.service -f"
 echo "  Verify write access   : systemctl show domainblock.service -p ReadWritePaths -p PrivateTmp"
 echo "  Edit patterns        : $INSTALL_DIR/domainblock-patterns.txt   (no restart needed)"
+echo ""
+echo "  seen.csv log rotation : /etc/logrotate.d/domainblock (monthly, 6 kept)"
+echo "  Monthly report timer  : systemctl list-timers domainblock-report.timer"
+echo "                          (no-op until monthly_report: true is set in config.yml)"
+echo "  Test the report now   : sudo -u $SERVICE_USER DOMAINBLOCK_DRYRUN=1 DOMAINBLOCK_DEBUG=1 \\"
+echo "                            $RUBY_BIN $INSTALL_DIR/domainblock-monthly-report.rb"
 echo ""
 echo "If you haven't yet, do a manual dry-run first to confirm router connectivity:"
 echo "  sudo -u $SERVICE_USER DOMAINBLOCK_DEBUG=1 $RUBY_BIN $INSTALL_DIR/domainblock.rb"
