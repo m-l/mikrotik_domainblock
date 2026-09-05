@@ -255,6 +255,7 @@ end
 SCRIPT_DIR    = File.dirname(File.realpath(__FILE__))
 CONFIG_PATH   = ENV.fetch("DOMAINBLOCK_CONFIG",   File.join(SCRIPT_DIR, "config.yml"))
 PATTERNS_PATH = ENV.fetch("DOMAINBLOCK_PATTERNS", File.join(SCRIPT_DIR, "domainblock-patterns.txt"))
+ASN_PATTERNS_PATH = ENV.fetch("DOMAINBLOCK_ASN_PATTERNS", File.join(SCRIPT_DIR, "domainblock-asn-patterns.txt"))
 
 config = YAML.safe_load(File.read(CONFIG_PATH))
 
@@ -268,6 +269,14 @@ CHECK_LIST  = config.fetch("check_list",  "domainblock-check")
 BANNED_LIST = config.fetch("banned_list", "domainblock-banned")
 BAN_TIMEOUT = config.fetch("ban_timeout", "10d")   # ban length; default 10 days
 DNS_TIMEOUT = config.fetch("dns_timeout", 3).to_i
+
+# ASN / datacenter check: a second, independent signal alongside PTR matching.
+# Looks up each unmatched candidate's Autonomous System via Team Cymru's
+# whois-over-DNS service (asn.cymru.com) — plain DNS TXT queries, the same
+# stdlib Resolv already used for PTR, no gem and no local GeoIP/ASN database
+# to maintain. Catches datacenter IPs that simply have no PTR record at all,
+# which PTR matching structurally cannot see. Off by default.
+ASN_CHECK = config.fetch("asn_check", false)
 
 # Watched-ports auto-management (forward/DSTNAT queue rule dst-port sync).
 # Enabled by default; set `watched_ports_manage: false` in config to turn off.
@@ -289,7 +298,12 @@ BAN_CACHE_COUNTER = config.fetch("ban_cache_counter", "/tmp/domainblock-run-coun
 # Recon log: append every candidate's PTR-lookup verdict to a CSV so you can
 # spot NEW attacker domain clusters that aren't in your patterns yet. Records
 # the PTR the script already computes (no extra DNS). Off by default.
-# Format:  timestamp,ip,ptr,verdict   (verdict = banned | no-match | no-ptr)
+# Format:  timestamp,ip,ptr,verdict,detail
+#   verdict = banned-ptr | banned-asn | no-match | no-ptr
+#   detail  = the matched PTR pattern for banned-ptr; "AS<num> <name>" for
+#             banned-asn, or for no-match/no-ptr rows where an ASN lookup was
+#             performed but didn't match domainblock-asn-patterns.txt yet —
+#             handy for spotting new hosting providers worth adding.
 SEEN_LOG_ON   = config.fetch("seen_log", false)
 SEEN_LOG_FILE = SEEN_LOG_ON ? File.expand_path(config.fetch("seen_log_file", "seen.csv"), SCRIPT_DIR) : nil
 
@@ -300,9 +314,9 @@ logger.formatter = proc { |sev, time, _p, msg| "#{time.strftime('%Y-%m-%d %H:%M:
 # ============================================================================
 # Patterns
 # ============================================================================
-def load_patterns(path, logger)
+def load_patterns(path, logger, label: "Patterns")
   unless File.exist?(path)
-    logger.warn "Patterns file #{path} not found; nothing will be banned."
+    logger.warn "#{label} file #{path} not found; nothing will be banned via this signal."
     return []
   end
   File.readlines(path).filter_map do |line|
@@ -324,6 +338,14 @@ def hostname_matches?(hostname, patterns)
   patterns.any? { |p| glob_to_regexp(p).match?(h) }
 end
 
+# ASN "AS Name" strings are free text (company names, commas, dashes) — not
+# DNS labels — so this uses a plain case-insensitive shell glob rather than
+# the label-anchored regexp above.
+def asn_name_matches?(asn_name, patterns)
+  return false if asn_name.nil?
+  patterns.any? { |p| File.fnmatch(p, asn_name, File::FNM_CASEFOLD) }
+end
+
 # ============================================================================
 # Reverse DNS
 # ============================================================================
@@ -336,12 +358,42 @@ rescue Resolv::ResolvError, IOError, SystemCallError, Timeout::Error
   []
 end
 
+# ============================================================================
+# ASN lookup (Team Cymru whois-over-DNS) — only called when PTR matching
+# didn't already ban the IP, so this adds no extra queries for the common
+# case. Protocol: https://asn.cymru.com/#whois — two plain TXT queries.
+# ============================================================================
+def txt_lookup(name, timeout)
+  Resolv::DNS.open do |dns|
+    dns.timeouts = timeout
+    dns.getresources(name, Resolv::DNS::Resource::IN::TXT).map { |r| r.strings.join }
+  end
+rescue Resolv::ResolvError, IOError, SystemCallError, Timeout::Error
+  []
+end
+
+def asn_lookup(ip, timeout)
+  octets = ip.split(".").reverse.join(".")
+  origin = txt_lookup("#{octets}.origin.asn.cymru.com", timeout).first
+  return nil unless origin
+
+  asn = origin.split("|").first.to_s.strip.split(" ").first
+  return nil if asn.nil? || asn.empty?
+
+  name_rec = txt_lookup("AS#{asn}.asn.cymru.com", timeout).first
+  return nil unless name_rec
+
+  fields = name_rec.split("|").map(&:strip)
+  { asn: asn, name: fields[4] }
+end
+
 # Append one recon record. Best-effort: never let a logging failure disrupt the
 # ban pass. ptr may be empty (no-ptr). Commas/newlines in the PTR are sanitised.
-def seen_log_append(path, ip, ptr, verdict)
+def seen_log_append(path, ip, ptr, verdict, detail: "")
   return if path.nil?
-  safe_ptr = ptr.to_s.tr(",\n\r", "   ").strip
-  line = "#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')},#{ip},#{safe_ptr},#{verdict}\n"
+  safe_ptr    = ptr.to_s.tr(",\n\r", "   ").strip
+  safe_detail = detail.to_s.tr(",\n\r", "   ").strip
+  line = "#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')},#{ip},#{safe_ptr},#{verdict},#{safe_detail}\n"
   File.open(path, "a") { |f| f.write(line) }
 rescue SystemCallError
   nil
@@ -442,7 +494,11 @@ end
 # ============================================================================
 patterns = load_patterns(PATTERNS_PATH, logger)
 logger.info "Loaded #{patterns.size} pattern(s) from #{PATTERNS_PATH}"
-exit 0 if patterns.empty?
+
+asn_patterns = ASN_CHECK ? load_patterns(ASN_PATTERNS_PATH, logger, label: "ASN patterns") : []
+logger.info "Loaded #{asn_patterns.size} ASN pattern(s) from #{ASN_PATTERNS_PATH}" if ASN_CHECK
+
+exit 0 if patterns.empty? && asn_patterns.empty?
 
 begin
   api = RouterOS.new(host: ROUTER_HOST, port: ROUTER_PORT, user: ROUTER_USER,
@@ -491,28 +547,34 @@ begin
       next
     end
 
-    names = reverse_lookup(ip, DNS_TIMEOUT)
-    if names.empty?
-      logger.debug "#{ip} -> (no PTR)"
-      seen_log_append(SEEN_LOG_FILE, ip, "", "no-ptr") if SEEN_LOG_ON
+    names     = reverse_lookup(ip, DNS_TIMEOUT)
+    ptr_match = names.find { |n| hostname_matches?(n, patterns) }
+
+    asn_info = nil
+    if ptr_match
+      reason  = "PTR #{ptr_match}"
+      comment = "domainblock: PTR #{ptr_match} @#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')}"
+    elsif ASN_CHECK && (asn_info = asn_lookup(ip, DNS_TIMEOUT)) && asn_name_matches?(asn_info[:name], asn_patterns)
+      reason  = "ASN AS#{asn_info[:asn]} #{asn_info[:name]}"
+      comment = "domainblock: #{reason} @#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')}"
+    else
+      ptr_desc   = names.empty? ? "(no PTR)" : names.join(", ")
+      asn_desc   = asn_info ? " / AS#{asn_info[:asn]} #{asn_info[:name]}" : ""
+      asn_detail = asn_info ? "AS#{asn_info[:asn]} #{asn_info[:name]}" : ""
+      logger.debug "#{ip} -> #{ptr_desc}#{asn_desc} (no match)"
+      seen_log_append(SEEN_LOG_FILE, ip, names.first, names.empty? ? "no-ptr" : "no-match",
+                       detail: asn_detail) if SEEN_LOG_ON
       next
     end
 
-    match = names.find { |n| hostname_matches?(n, patterns) }
-    unless match
-      logger.debug "#{ip} -> #{names.join(', ')} (no match)"
-      seen_log_append(SEEN_LOG_FILE, ip, names.first, "no-match") if SEEN_LOG_ON
-      next
-    end
-
-    comment = "domainblock: #{match} @#{Time.now.strftime('%Y-%m-%dT%H:%M:%S')}"
     begin
       api.talk(["/ip/firewall/address-list/add",
                 "=list=#{BANNED_LIST}", "=address=#{ip}",
                 "=timeout=#{BAN_TIMEOUT}", "=comment=#{comment}"])
       banned_now += 1
-      logger.info "BANNED #{ip} (PTR #{match})"
-      seen_log_append(SEEN_LOG_FILE, ip, match, "banned") if SEEN_LOG_ON
+      logger.info "BANNED #{ip} (#{reason})"
+      seen_log_append(SEEN_LOG_FILE, ip, names.first, ptr_match ? "banned-ptr" : "banned-asn",
+                       detail: ptr_match || "AS#{asn_info[:asn]} #{asn_info[:name]}") if SEEN_LOG_ON
     rescue RouterOS::Error => e
       if e.message.include?("already have")
         logger.debug "#{ip} already banned"

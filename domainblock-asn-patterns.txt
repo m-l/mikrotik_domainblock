@@ -1,0 +1,45 @@
+# /etc/domainblock/domainblock-asn-patterns.txt
+#
+# One ASN "AS Name" pattern per line. Only consulted for a candidate IP that
+# did NOT already match domainblock-patterns.txt (i.e. no PTR, or a PTR that
+# didn't match) — see README for why this is a separate, second signal.
+#
+# The IP's Autonomous System is looked up via Team Cymru's whois-over-DNS
+# service and compared against these patterns. Requires `asn_check: true` in
+# config.yml (off by default).
+#
+# Syntax: plain case-insensitive shell glob (NOT the label-anchored glob used
+# for PTR patterns above — ASN names are free text: company names, commas,
+# dashes), matched against the full "AS Name" field, e.g.:
+#   AS41608 | ES | ripencc | 2017-07-19 | NextGenWebs-NL - NextGenWebs, S.L., ES
+#                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# so *NextGenWebs* matches that whole line.
+#
+# Lines starting with '#' and blank lines are ignored.
+# Edit this file freely — no restart needed; the next run picks it up.
+#
+# Turn on `seen_log: true` in config.yml first and watch seen.csv for a
+# while — unmatched candidates with an ASN name get logged with that name in
+# the detail column, so you can see which hosting providers are actually
+# hitting you before deciding which ones to add here.
+
+# --- Major clouds commonly used for scanning ---
+*AMAZON*
+*GOOGLE-CLOUD*
+*MICROSOFT-CORP*
+*ALIBABA*
+*ORACLE-*-ASN*
+
+# --- VPS / hosting providers commonly used for scanning ---
+*HETZNER*
+*DIGITALOCEAN*
+*OVH*
+*LINODE*
+*VULTR*
+*CONTABO*
+*SCALEWAY*
+*M247*
+
+# --- Add your own below as you spot them in seen.csv, e.g. ---
+# *NextGenWebs*
+# *YOUR-PROVIDER-HERE*
