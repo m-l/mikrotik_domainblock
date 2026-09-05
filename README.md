@@ -15,6 +15,11 @@ Bans are cached to disk and survive both router reboots and script restarts (see
 **Ban-cache persistence** below) — the MikroTik's dynamic address-list is wiped
 on restart, so without the cache a scheduled reboot would empty your ban list.
 
+Optionally, the script can also ban by **ASN / hosting-provider name** (see
+**Optional: block by datacenter/ASN too** below) — a second signal for
+datacenter IPs that have no PTR record at all, which reverse-DNS matching
+structurally cannot see.
+
 No Docker, no CrowdSec, no gems — the script talks the RouterOS API directly
 using only Ruby's standard library. Everything lives self-contained in one
 install directory.
@@ -64,7 +69,8 @@ block rules at all — the rules are inert until the script bans something.
 ```
 domainblock.rb               the script (reads config + patterns from its own dir)
 config.yml                   router IP, credentials, list names, timeouts, watched-ports + ban-cache opts
-domainblock-patterns.txt     your block patterns — the thing you edit
+domainblock-patterns.txt     your PTR block patterns — the thing you edit
+domainblock-asn-patterns.txt your ASN/datacenter block patterns (optional, asn_check: true)
 ban-cache.txt                auto-generated: banned IPs snapshot (survives reboots); do not edit while running
 install.sh                   sets up the systemd service + timer
 uninstall.sh                 removes them
@@ -544,11 +550,15 @@ Scanners come from far more than AWS and Google — Censys, Shodan, Onyphe,
 BinaryEdge, Stretchoid, Linode, Contabo and others scan constantly. To discover
 which providers are hitting you that your patterns *don't* yet catch, enable the
 recon log (`seen_log: true` in config). The script then records every
-candidate's PTR verdict to `seen.csv` — using the reverse-DNS it already looks up
-during the normal run, so no extra DNS work:
+candidate's verdict to `seen.csv` — using the PTR (and, if `asn_check` is on,
+the ASN) it already looked up during the normal run, so no extra DNS work:
 
 ```
-timestamp,ip,ptr,verdict          # verdict = banned | no-match | no-ptr
+timestamp,ip,ptr,verdict,detail
+# verdict = banned-ptr | banned-asn | no-match | no-ptr
+# detail  = matched PTR pattern for banned-ptr; "AS<num> <name>" for
+#           banned-asn, or for no-match/no-ptr rows where asn_check found an
+#           ASN that just isn't in domainblock-asn-patterns.txt yet
 ```
 
 The `no-match` rows are the gold: IPs that connected but **weren't** banned —
@@ -560,8 +570,16 @@ awk -F, '$4=="no-match"{print $3}' /opt/mikrotik_blockdomain/seen.csv \
 ```
 
 A cloud/scanner provider trending near the top is a pattern worth adding to
-`domainblock-patterns.txt`. `no-ptr` rows are IPs with no reverse-DNS at all —
-they can't be caught by this tool (use IP-reputation like CrowdSec for those).
+`domainblock-patterns.txt`.
+
+If `asn_check` is on, do the same against column 5 to find ASN names worth
+adding to `domainblock-asn-patterns.txt` — this is what catches the `no-ptr`
+rows too, since those are exactly the IPs reverse-DNS matching can't see:
+
+```
+awk -F, '$5!=""{print $5}' /opt/mikrotik_blockdomain/seen.csv \
+  | sort | uniq -c | sort -rn | head -30
+```
 
 Common scanner suffixes worth blocking once you see them: `*.censys-scanner.com`,
 `*.shodan.io`, `*.onyphe.net`, `*.binaryedge.ninja`, `*.stretchoid.com`,
@@ -574,6 +592,52 @@ legitimate users or your own backup WAN.
 `: > seen.csv` after reviewing). Without the recon log you can still spot
 patterns by reverse-resolving the syslog feed, but that re-does hundreds of DNS
 lookups each time — the recon log captures them once, for free.
+
+### Optional: block by datacenter/ASN too
+
+PTR matching structurally can't catch a datacenter IP that just has **no PTR
+record** — the reverse-lookup returns nothing to match against, so the IP is
+logged as `no-ptr` and never banned, no matter what's in
+`domainblock-patterns.txt`. Set `asn_check: true` in `config.yml` to add a
+second, independent signal: for any candidate PTR matching didn't already ban,
+the script looks up which network (Autonomous System) the IP belongs to and
+checks its name against `domainblock-asn-patterns.txt`.
+
+The lookup uses [Team Cymru's whois-over-DNS
+service](https://asn.cymru.com/#whois) — two plain DNS TXT queries, the same
+`Resolv` stdlib already used for the PTR lookup. No gem, no local GeoIP/ASN
+database to download or keep current, and it only runs for candidates that
+weren't already banned by PTR, so it adds no extra queries for the common case.
+
+```
+/opt/domainblock/domainblock-asn-patterns.txt   # one glob per line, e.g. *HETZNER*
+```
+
+Unlike the PTR patterns (label-anchored: `*.example.com` matches
+`foo.example.com`), ASN names are free text — company names, commas, dashes
+(e.g. `NextGenWebs-NL - NextGenWebs, S.L., ES`) — so these patterns are matched
+as a plain case-insensitive glob against the whole name.
+
+**Worked example** (from testing this feature): `185.213.175.37` has no PTR at
+all — the existing script would silently pass it through. Its ASN resolves to
+`AS41608, NextGenWebs-NL - NextGenWebs, S.L., ES`, a Spanish hosting provider,
+which the ban comment records as:
+
+```
+domainblock: ASN AS41608 NextGenWebs-NL - NextGenWebs, S.L., ES @2026-09-05T...
+```
+
+You won't know most regional hosting-provider names in advance the way you
+know AMAZON/HETZNER/OVH. Turn on `seen_log` (previous section) and let it run
+for a while — every unmatched candidate that has an ASN gets that name logged
+in the `detail` column, so you can see which providers are actually hitting
+you before deciding which ones to add.
+
+Not a substitute for `domainblock-patterns.txt` — most datacenter IPs already
+carry a matching PTR, so this mainly closes the no-PTR gap and gives
+defense-in-depth for the providers you specifically list. It's also not
+country-level GeoIP blocking; it identifies the network operator, not the
+country, which is what "block this datacenter" actually calls for.
 
 ---
 
@@ -618,6 +682,9 @@ slate: `rm -f ban-cache.txt /tmp/domainblock-run-counter`.
   (googleusercontent / amazonaws / etc.), which is exactly the target case.
   Attackers on residential IPs with no PTR won't be caught by reverse-DNS
   matching; IP-reputation tools (e.g. CrowdSec) are the complement for those.
+  A datacenter IP with no PTR is a narrower case the optional `asn_check`
+  (see "Optional: block by datacenter/ASN too") can catch instead, since ASN
+  membership doesn't depend on the provider having set rDNS at all.
 - **Reactive by up to one interval:** a brand-new IP gets a connection or two
   through before its next-run lookup bans it. Fine for brute-force attempts.
 - **Bans are dynamic and RAM-only on the router** — wiped on reboot. The ban

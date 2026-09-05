@@ -11,7 +11,14 @@ banned_list: domainblock-banned    # list the drop rules block
 
 # ── Ban behaviour ──────────────────────────────────────────────────
 ban_timeout: 10d                   # how long a ban lasts; default 10 days
-dns_timeout: 3                     # seconds per reverse-DNS lookup
+dns_timeout: 3                     # seconds per reverse-DNS / ASN lookup
+
+# ── ASN / datacenter check (second signal, alongside PTR patterns) ───
+# Only consulted for a candidate that PTR matching didn't already ban (no
+# PTR at all, or a PTR that didn't match anything). Looked up via Team
+# Cymru's whois-over-DNS service, no gem, no local database. See
+# domainblock-asn-patterns.txt and the README section on this feature.
+asn_check: false                  # true = also check ASN name patterns
 
 # ── Watched-ports auto-management (forward queue rule dst-port sync) ─
 watched_ports_manage: true         # false = leave the forward rule alone
